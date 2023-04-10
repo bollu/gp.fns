@@ -147,14 +147,32 @@ classdef MESH < handle
             opts.diagcomp = 1E-5;
             opts.type = 'ict';
             opts.droptol = 1E-5;
+            % TODO: understand preconditioning. Why does it improve performance?
+            % compute W_precon such that W_precon@W_precon = mesh.W
             mesh.W_precon = ichol(mesh.W, opts);
 
             % initialize data needed for vf2op
+            % ChatGPT:
+            % ========
+            %  These matrices are used to represent the gradient and divergence
+            %  operators on the mesh in the finite element method. Specifically,
+            %  they are used to compute the vector field Laplacian operator, which
+            %  is a generalization of the Laplace-Beltrami operator to vector
+            %  fields on the surface.
+            % Bollu
+            % =====
+            % mesh.JJc1 is a [Fx3] matrix, where mesh.JC1[k] is
+            % orthogonal to both normal as well as (v2 - v3) of the triangle 'k'.
+            % This means that it is in the direction towards/away from 'v1',
+            % and has length equal to '(v2 - v3)'.
             [ mesh.JJc1, mesh.JJc2, mesh.JJc3 ] = mesh.vf2op_initialization();
 
         end
 
         function [ l2 ] = dot( mesh, f, g )
+            % inner product where 'mesh.va' is the mass matrix, since
+            % the mass matrix `mesh.va` represents the inner product of basis vecotrs: A[i, j] := int_A hi . hj.
+            % where hi is the hat function: 1 at the vertex 'i', 0 at all other vertices.
             l2 = f'*(mesh.va.*g);
         end
 
@@ -226,6 +244,12 @@ classdef MESH < handle
         end
 
         function [ fp ] = project( mesh, f )
+          % ChatGPT:
+          % =======
+          %   project to space of harmonic functions on the mesh.
+          %   we project to space of the laplace beltrami eigenvalues.
+          %   y = x - A^{-1}xA
+          %   TODO: I am still very confused about this.
             fp = f - (mesh.LB_basisi(1,:)*f)*mesh.LB_basis(:,1);
         end
 
@@ -235,20 +259,22 @@ classdef MESH < handle
 
         function [ lif ] = laplaceInverseF( mesh, f, guess, prec )
             if nargin < 3
-                guess = mesh.last_laplace_inverse;
+                guess = mesh.last_laplace_inverse; % laplace inverse cache.
             end
             if nargin < 4
                 prec = 1e-12;
             end
             if mesh.nv < 200
-                lif = mesh.L \ f;
+                lif = mesh.L \ f; % perform inverse directly
             else
                 WL = mesh.W;
                 PC = mesh.W_precon;
                 b = mesh.project(mesh.A*f);
+                % solve WL u = b with preconditioner 'prec' that is an approximate inverse for WL.
+                % TODO: see why 'prec' is an approximate inverse for 'WL'.
                 [lif,flag,~,~,~] = pcg(WL,b,prec,500,PC,PC',guess);
                 if flag
-                    lif = mesh.L \ f;
+                    lif = mesh.L \ f; % If algorithm does not converge, directly perform inverse.
                 end
             end
             lif = mesh.project( lif );
@@ -300,6 +326,8 @@ classdef MESH < handle
             W = sparse(mesh.IIn,mesh.JJn,Sn,mesh.nv,mesh.nv);
         end
 
+        % JC1 has vectors such that JC1[k] is the vector that is orthogonal to the normal of the triangle
+        % as well as the edge (v2 - v3), and has length that if (v2 - v3).
         function [JC1, JC2, JC3 ] = vf2op_initialization(mesh)
             X = mesh.vertices;
             T = mesh.triangles;
@@ -316,16 +344,61 @@ classdef MESH < handle
         end
 
         function op = DV(mesh, Vf)
+        % chatgpt
+        % ======
+        % To compute the operator corresponding to the divergence of Vf, the function
+        % first calls the vf2opWW method of the mesh structure to obtain a sparse
+        % matrix WW that approximates the dot product of the gradient operator
+        % and Vf. The vf2opWW method constructs a weighted sum of the gradients
+        % of Vf at each mesh vertex, using the local weights of the Voronoi cell
+        % of each vertex.
+        % The function then multiplies WW by the inverse of the mass matrix A to
+        % obtain an approximation of the divergence operator:
+        % op = A_INV * WW
             WW = mesh.vf2opWW(Vf);
             op = mesh.A_INV*WW;
         end
 
         function op = adDV(mesh, Vf)
+           % chatgpt
+           % ======
+           % div(Vf)' = - grad(Vf)
+           % div(Vf)' ~ -W' * Vf
+
+           % To compute the operator corresponding to the adjoint of the divergence
+           % of Vf, the function first calls the vf2opWW method of the mesh
+           % structure to obtain a sparse matrix WW that approximates the
+           % dot product of the gradient operator and Vf. The vf2opWW method
+           % constructs a weighted sum of the gradients of Vf at each mesh
+           % vertex, using the local weights of the Voronoi cell of each
+           % vertex.
+
+           % The function then multiplies the transpose of WW by the inverse
+           % of the mass matrix A to obtain an approximation of the
+           % adjoint of the divergence operator:
             WW = mesh.vf2opWW(Vf);
             op = mesh.A_INV*WW';
         end
 
         function WW = vf2opWW(mesh, Vf)
+          % chatgpt
+          % ======
+          % The Matlab function vf2opWW computes a matrix WW that corresponds to the
+          % operator W in the finite element method, based on the vector field Vf defined
+          % on the mesh.
+          % First, it calculates the values of the components of the stress
+          % tensor Sij and Sji at each mesh vertex using the dot product between
+          % the corresponding coordinate vectors and Vf. Then, it assembles the
+          % stress tensor components into a single vector Sn and uses the sparse
+          % matrix function sparse to create a sparse matrix WW. The matrix WW is
+          % assembled based on the indices in mesh.IIn and mesh.JJn, which are
+          % the row and column indices, respectively, of the non-zero entries of
+          % WW. Finally, WW is returned as the output of the function.
+          % In summary, the function vf2opWW maps a vector field
+          % Vf to a matrix WW that represents the corresponding
+          % operator W in the finite element method.
+
+
             Sij = 1/6*[dot(mesh.JJc2,Vf,2); dot(mesh.JJc3,Vf,2); dot(mesh.JJc1,Vf,2)];
             Sji = 1/6*[dot(mesh.JJc1,Vf,2); dot(mesh.JJc2,Vf,2); dot(mesh.JJc3,Vf,2)];
             Sn = [Sij;Sji;-Sij;-Sji];

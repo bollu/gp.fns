@@ -83,7 +83,8 @@ classdef MESH < handle
             mesh.IIn = [mesh.II;mesh.JJ;mesh.II;mesh.JJ]; %12fx1 column vector given by (II <> JJ <> II <> JJ)
             mesh.JJn = [mesh.JJ;mesh.II;mesh.II;mesh.JJ]; %12fx1 column vector given by (JJ <> II <> JJ <> II)
 
-            % compute mass matrix.
+            % compute mass matrix in barycentric coords?
+            % in (https://graphics.stanford.edu/courses/cs468-13-spring/assets/lecture12-lu.pdf), this is called A^triangle[i][j]
             mesh.M = mesh.mass_matrix_barycentric();
             % what is AA? sum of each of the rows. AA[i] = Σj M[i][j].
             % AA[i] will be the total mass "adjacent" to `i`.
@@ -97,25 +98,16 @@ classdef MESH < handle
             % spdiags(_, 0, _, _): place on main diagonal.
             % spdiags(_, δ, _, _): place relative to main diagonal.
             %    +ve → above main diagonal, -ve → below main diagonal
-            % ChatGPT
-            % =======
-            %   In particular, the entries of the mass matrix A are given by the
-            %   integrals of the product of pairs of basis functions over the
-            %   domain of each finite element. The diagonal entries of the mass
-            %   matrix correspond to the masses associated with each node in the
-            %   mesh.
-            %   For example, in the context of a surface mesh, the mass matrix A is
-            %   typically constructed from the surface area of each triangle in the
-            %   mesh. Specifically, the diagonal entries of the mass matrix are
-            %   proportional to the areas of the triangles adjacent to each vertex
-            %   in the mesh.
+            % in (https://graphics.stanford.edu/courses/cs468-13-spring/assets/lecture12-lu.pdf), this is called
+            % as the lumped mass matrix, with a(ii) = Area(dual cell i) ?
+            % TODO: why is this legal? Why do we phrase laplacian in terms of this?
             mesh.A = spdiags(mesh.va, 0, mesh.nv, mesh.nv);
             % inverse sparse matrix of 'A', since [NxN]
             mesh.A_INV = spdiags(mesh.va_inv, 0, mesh.nv, mesh.nv);
 
             % compute cotan Laplacian
-            mesh.W = mesh.cotLaplacian();
-            mesh.L = mesh.A_INV * mesh.W;
+            mesh.W = mesh.cotLaplacian(); % why W?
+            mesh.L = mesh.A_INV * mesh.W; % why L?
             mesh.LL = mesh.L * mesh.L;
 
             % compute some eigenvectors of L.
@@ -162,9 +154,8 @@ classdef MESH < handle
             % Bollu
             % =====
             % mesh.JJc1 is a [Fx3] matrix, where mesh.JC1[k] is
-            % orthogonal to both normal as well as (v2 - v3) of the triangle 'k'.
-            % This means that it is in the direction towards/away from 'v1',
-            % and has length equal to '(v2 - v3)'.
+            % JC1 has vectors. Let tri[k] = (v1, v2, v3). Then JC1[k] is the vector in the triangle
+            % that is orthogonal to (v2 - v3) and has length (v2 - v3). It is given by: (v2 - v3) x unit-normal(tri[k])
             [ mesh.JJc1, mesh.JJc2, mesh.JJc3 ] = mesh.vf2op_initialization();
 
         end
@@ -206,15 +197,34 @@ classdef MESH < handle
         function [ JV ] = J( mesh, V )
             JV = cross(mesh.N, V);
         end
-
+        %       f(a) = 1
+        %      /|
+        %     / |
+        %    /  |
+        %   /   H  ^
+        %  /    |  | JJc1 = yhat * |c - b| = yhat * B
+        % /     |
+        %*---B--*
+        %f(b) = f(c) = 0
+        %
+        % ([1, 1, 1] .* yhat * B) / (2 * 1/2BH)
+        % = (yhat * B) / (B H)
+        % = yhat / H
+        % which is exactly what the gradient should be, if we assume that the
+        %   gradient changes by 1/H over the full 'H' distance to get from '1' to
+        %   '0'.
+        % TODO: but this is different from the paper about using vector fields,
+        %  since thee, we are supposed to have functions on faces, NOT vertices!
+        %  In that theory, we were supposd to use an averaging operator in the worst case,
+        %  something I do not see here.
         function [ gradF ] = grad( mesh, f )
             % input function is defined on vertices (nv x 1)
             T = mesh.triangles;
-            Ar = repmat(mesh.ta,1,3);
-            G = repmat(f(T(:,1)),1,3) .* mesh.JJc1 + ...
+            Ar = repmat(mesh.ta,1,3); % make a vector [area[tri], area[tri], area[tri]]
+            G = repmat(f(T(:,1)),1,3) .* mesh.JJc1 + ... % for all faces, compute f(vertex '1' of face), which rescales the vector that points towards vector 1
                 repmat(f(T(:,2)),1,3) .* mesh.JJc2 + ...
                 repmat(f(T(:,3)),1,3) .* mesh.JJc3;
-            gradF = G./(2*Ar);
+            gradF = G./(2*Ar); % divide each gradient by the area of the triangle
         end
 
         function [ V ] = curlF( mesh, s )
@@ -249,7 +259,10 @@ classdef MESH < handle
           %   project to space of harmonic functions on the mesh.
           %   we project to space of the laplace beltrami eigenvalues.
           %   y = x - A^{-1}xA
-          %   TODO: I am still very confused about this.
+          %   TODO: I am still very confused about this, because it seems to be REMOVING the components that
+          %   are harmonic? it's doing f - <stuff> ?
+          %   unless the operator below in the <stuff> is projecting to the subspace that is *orthogonal* to harmonics?
+          %   seems weird.
             fp = f - (mesh.LB_basisi(1,:)*f)*mesh.LB_basis(:,1);
         end
 
@@ -282,7 +295,18 @@ classdef MESH < handle
         end
 
         % https://graphics.stanford.edu/courses/cs468-13-spring/assets/lecture12-lu.pdf
-        function M = mass_matrix_barycentric(mesh)
+        % consider a triangle ABC
+        % t=0             A ha(A) = 1
+        %                 /\
+        %                /  \
+        %             --=----=-- ha(t) = t ; width of this =
+        %              /      \
+        % t=1         C--------B ha(B) = ha(C) = 0
+        %
+        % suppose i = j. Then:
+        %  \int_A ha . ha
+        % = \int_t ha(t) ha(t)
+        function M = mass_matrix_barycentric(mesh) % [VxV] matrix. M[i][j] = integral_{triangle} h[i] h[j] dA
             Ar = mesh.ta; % take areas of all triangles: nx1
             % https://libigl.github.io/libigl-python-bindings/tut-chapter1/#mass-matrix
             Mij = 1/12*[Ar; Ar; Ar]; % Mij = 1/12 times the vector (area, area, rea)
